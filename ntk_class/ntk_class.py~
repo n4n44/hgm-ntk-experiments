@@ -1,0 +1,172 @@
+import numpy as np
+import time
+import scipy.linalg
+from .activator.hgm import batch_data_loader as batch_dl
+from .util import gauss_herm
+
+class ntk:
+    def __init__(self,layers,activator,beta=0,cuda_mode = False):
+        self.activator = activator
+        self.layers = layers
+        self.beta = beta
+        self.pred_mode = False
+        self.gauss_herm_q = 50
+        self.threshould = 1e-5
+        self.cuda_mode = cuda_mode
+        self._debug_mode = False
+    def ev_kernel(self,covars,mode = 'hgm',rtol = 1e-10,atol = 1e-10,debug_mode = False):
+        if mode == 'hgm':
+            sigma,sigma_dot = self._hgm_ev_kernel()
+        if mode == 'hgm_fast':
+            sigma,sigma_dot = self._fast_hgm_ev_kernel()
+        if mode == 'closed':
+            sigma,sigma_dot = self._closed_ev_kernel()
+        
+        return ntk_array
+        
+    def train(self,sample_x,sample_y,diag_reg=0,mode = 'hgm',get_timing = False,rtol = 1e-10, atol = 1e-10):
+        # covarsは(3,n)のndarrayにする.
+        
+        self.sample_x = sample_x
+        self.sample_y = sample_y
+        self.pred_mode = False
+        self.kernel_mat = np.zeros((self.sample_x.shape[0],self.sample_x.shape[0]))
+        if get_timing == True:
+            start = time.time()
+
+        sample_pts = batch_dl.make_pair(self.sample_x)
+        
+        sample_pts = batch_dl.add_index(sample_pts)
+
+        covars = make_covars(sample_pts)
+        
+        sigma_array, sigma_dot_array = self.ev_kernel(covars,rtol = rtol, mode = mode,atol = atol,debug_mode = debug_mode)
+
+        
+        for i in range(sample_pts.shape[0]):
+            ntk = 0
+            for s in range(self.layers):
+
+                sigma_dot = 1
+                for t in range(s+1,self.layers):
+                    #print(sigma_dot_array[t-1][i])
+                    
+                    sigma_dot = sigma_dot*sigma_dot_array[t-1][i]
+                
+                ntk = ntk +(sigma_dot*sigma_array[s][i])
+            self.kernel_mat[i] = ntk
+
+        
+        if get_timing == True:
+           end = time.time()
+           training_time = end - start
+           start = time.time()
+        self.pred_matrix = scipy.linalg.solve(self.kernel_mat+diag_reg*np.identity(self.sample_x.shape[0]),self.sample_y,assume_a = 'sym')
+        if get_timing == True:
+            end = time.time()
+            solve_time = end-start
+        self.pred_mode = True
+        print('Training finished.')
+        if get_timing == True:
+            print(f'Training time:{training_time}, solve_time: {solve_time}')
+    def pred():
+        return 0
+
+    def train_pred():
+        return 0
+
+    def _hgm_ev_kernel(self,covars,rtol = 1e-10,atol = 1e-10):
+        return 0
+    
+    def _fast_hgm_ev_kernel(self,covars,rtol, atol):
+        sigma_array = np.zeros((self.layers,covars.shape[0]))
+        sigma_dot_array = np.zeros((self.layers,covars.shape[0]))
+        for l in range(self.layers-1):
+            degene_covars = []
+            
+            if l == 0:
+                dat = covars
+            else :
+                dat = self._make_covars_from_sigma(sigma_array[l])
+                
+            [dat2,removed,removed_small_covar,removed_large_covar]=batch_dl.sort_dat(dat,small_covar=self.activator.hgm_small_covar,large_covar = self.activator.hgm_large_covar,threshould=1e-5,initial_point = self.activator.batch_init,even = None)
+
+
+            removed = removed.reshape(-1,5)
+
+            dat2 = np.vstack((dat2,dat2[0])) # Add dummy data to the end to evaluate all points in solve_ivp
+
+            sol = self.activator.batch_hgm(dat2,qsize=-1,rtol = rtol,atol = atol)
+            hgm_sol = sol[0].reshape(-1,1)
+            diff_sol = self.activator.batch_hgm_dot(dat2,qsize=-1,rtol = rtol,atol = atol)
+            hgm_diff_sol = diff_sol[0].reshape(-1,1)
+
+            degene_sol, degene_diff_sol = self._ev_degene_sigmas(removed_small_covar,rtol,atol)
+            #removed_sol, removed_diff_sol = self._ev_removed_sigmas(removed)
+
+            for i in range(dat2.shape[0]-1):
+                idx =int(dat2[i][3])
+                x = np.array([[dat2[i][0],dat2[i][1]],[dat2[i][1],dat2[i][2]]])
+                covar = np.linalg.inv(-2*x)
+                nc2x = self.activator.nc2(dat2[i][0:3])
+                
+                if idx >= 0:
+                    if l < self.layers-1:
+                        #print(hgm_sol[i],hgm_diff_sol[i])
+                        sigma_array[l+1][idx] = (self.activator.c_sigma*hgm_sol[i])/nc2x+self.beta**2
+                        sigma_dot_array[l][idx] = (self.activator.c_sigma*hgm_diff_sol[i])/nc2x
+
+            for i in range(removed_small_covar.shape[0]):
+                idx = int(removed_small_covar[i][3])
+                if l < self.layers-1:
+                    sigma_array[l+1][idx] = self.activator.c_sigma*small_covar_sol[i]+self.beta**2
+                    sigma_dot_array[l][idx] = self.activator.c_sigma*small_covar_diff_sol[i]
+
+            for i in range(removed.shape[0]):
+                idx1 = int(removed[i][3])
+                idx2 = int(removed[i][4])
+                if l < self.layers-1:
+                    # gauss-hermの値と比較する
+                    sigma_array[l+1][idx1] = sigma_array[l+1][idx2]
+                    sigma_dot_array[l][idx1] = sigma_dot_array[l][idx2]
+        return sigma_array,sigma_dot_array
+
+    def _ev_degene_sigmas(degene_covars,rtol,atol):
+        degene_sol = []
+        degene_diff_sol = []
+        for i in range degene_covars.shape[0]:
+            tmp_sol,tmp_diff_sol = self.activator.degene_sigmas(degene_covars[i])
+            degene_sol = np.append(degene_sol,tmp_sol)
+            degene_diff_sol = np.append(degene_diff_sol,tmp_diff_sol)
+        return degene_sol,degene_diff_sol
+
+    # def _ev_removed_sigmas(removed,hgm_sol,hgm_diff_sol):
+    #     removed_sol =[]
+    #     degene_diff_sol = []
+    #     for i in range(removed)
+    def make_covars(pts):
+        covars = []
+        sigmas= np.dot(pts,pts.T)+self.beta**2
+        for i in range(sigmas.shape[0]):
+            for j in range(sigmas.shape[0]):
+                tmp_covar = np.array([sigmas[i][i],sigmas[i][j],sigmas[j][j]])
+                covars = np.append(covars,tmp_covar)
+        covars = np.array(covars)
+        covars = batch_dl.add_index(covars)
+        return covars
+
+    def make_covars_pred(test_pts,sample_pts):
+        covars = []
+        return covars 
+    def make_covars_from_sigma(sigma_array):
+        covars = []
+        size = int(np.sqrt(sigma_array.shape[0]))
+        for i in range(sigma_array.shape[0]):
+            idx1 = int(i/size)
+            idx2 = int(i%size)
+            tmp_covar = np.array(sigma_array[idx1*size+idx1],sigma_array[i],sigma_array[idx2*size+idx2])
+
+            covars = np.append(covars,tmp_covar)
+        covars = np.array(covars)
+        covars = batch_dl.add_index(covars)
+        return covars
